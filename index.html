@@ -1,0 +1,271 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>VR180 Player</title>
+<style>
+  html, body { margin: 0; height: 100%; background: #000; color: #ddd; overflow: hidden;
+    font: 14px/1.4 system-ui, sans-serif; }
+  canvas { display: block; width: 100vw; height: 100vh; }
+  #overlay { position: fixed; inset: 0; display: flex; align-items: center; justify-content: center; }
+  #overlay.hidden { display: none; }
+  #panel { background: #161616ee; border: 1px solid #333; border-radius: 10px; padding: 20px 24px; max-width: 560px; }
+  #panel h1 { margin: 0 0 8px; font-size: 20px; }
+  #panel kbd { background: #2a2a2a; border: 1px solid #444; border-radius: 4px; padding: 0 5px; font-size: 12px; }
+  #panel table { border-collapse: collapse; margin-top: 10px; }
+  #panel td { padding: 2px 10px 2px 0; vertical-align: top; }
+  button, label.btn { background: #2d6cdf; color: #fff; border: 0; border-radius: 6px; padding: 8px 14px;
+    font-size: 14px; cursor: pointer; display: inline-block; margin: 6px 6px 0 0; }
+  #hud { position: fixed; left: 8px; bottom: 8px; font-size: 12px; color: #9a9a9a; pointer-events: none;
+    white-space: pre; text-shadow: 0 0 3px #000; }
+</style>
+</head>
+<body>
+<canvas id="gl"></canvas>
+<div id="hud"></div>
+<div id="overlay">
+  <div id="panel">
+    <h1>VR180 Player</h1>
+    <div>Load side-by-side dual-fisheye images, then click <b>Start</b> to lock the pointer.
+      Head movement arrives as mouse motion from the XR driver's VR-Lite mouse mode.</div>
+    <label class="btn">Open images<input id="file" type="file" accept="image/*" multiple hidden></label>
+    <button id="start">Start</button>
+    <table>
+      <tr><td><kbd>Space</kbd> <kbd>R</kbd></td><td>Recenter view</td></tr>
+      <tr><td><kbd>→</kbd> <kbd>←</kbd></td><td>Next / previous image</td></tr>
+      <tr><td><kbd>S</kbd></td><td>Swap eyes (Canon RF dual fisheye needs this)</td></tr>
+      <tr><td><kbd>+</kbd> <kbd>-</kbd></td><td>Zoom (view field of view)</td></tr>
+      <tr><td><kbd>[</kbd> <kbd>]</kbd></td><td>Fisheye circle size</td></tr>
+      <tr><td><kbd>M</kbd></td><td>Toggle SBS / 2D output</td></tr>
+      <tr><td><kbd>F</kbd></td><td>Fullscreen</td></tr>
+      <tr><td><kbd>H</kbd></td><td>Toggle on-screen info</td></tr>
+      <tr><td><kbd>Esc</kbd></td><td>Release pointer, show this panel</td></tr>
+    </table>
+    <div style="margin-top:8px;color:#888">Gamepad: A next, B previous, Y recenter, X swap eyes, LT/RT zoom.
+      Drop images onto the window to load them too.</div>
+  </div>
+</div>
+<script>
+'use strict';
+// ---------- settings (URL params override defaults, e.g. ?sens=30&fov=46) ----------
+const P = new URLSearchParams(location.search);
+const num = (k, d) => (P.has(k) && isFinite(+P.get(k))) ? +P.get(k) : d;
+const S = {
+  sens: num('sens', 30),            // xr_driver mouse_sensitivity: mouse counts per degree of head rotation
+  viewFov: num('fov', 46),          // horizontal FOV per eye of the virtual camera (Rokid Max ~ 46-50 deg)
+  fishFov: num('fishfov', 180),     // fisheye lens field of view
+  circle: num('circle', 1.0),       // fisheye circle diameter relative to the half-image height
+  swap: P.get('swap') === '1',
+  sbs: P.get('sbs') !== '0',        // render left/right eye side by side (glasses in 3D mode)
+  invertX: P.get('invx') === '1',
+  invertY: P.get('invy') === '1',
+  hud: P.get('hud') !== '0',
+};
+
+// ---------- WebGL ----------
+const canvas = document.getElementById('gl');
+const gl = canvas.getContext('webgl2', { antialias: false });
+if (!gl) { document.body.textContent = 'WebGL2 is not available in this browser.'; throw new Error('no webgl2'); }
+
+const VS = `#version 300 es
+in vec2 p; out vec2 uv;
+void main() { uv = p; gl_Position = vec4(p, 0.0, 1.0); }`;
+
+// For each output pixel: build a view ray, rotate it by head yaw/pitch,
+// then look it up in an equidistant fisheye (r = f * theta).
+const FS = `#version 300 es
+precision highp float;
+in vec2 uv; out vec4 color;
+uniform sampler2D tex;
+uniform vec2 halfTan;      // tan(hfov/2), tan(vfov/2) of one eye's viewport
+uniform mat3 rot;          // head rotation
+uniform float sbs;         // 1 = two eye viewports side by side
+uniform float swapEyes;
+uniform float fishHalf;    // half of the fisheye FOV in radians
+uniform vec2 circleR;      // circle radius in texture uv units
+void main() {
+  vec2 q = uv;             // -1..1 across the whole canvas
+  float eye = 0.0;         // 0 left, 1 right
+  if (sbs > 0.5) {
+    eye = q.x < 0.0 ? 0.0 : 1.0;
+    q.x = eye < 0.5 ? q.x * 2.0 + 1.0 : q.x * 2.0 - 1.0;
+  }
+  vec3 dir = rot * normalize(vec3(q * halfTan, 1.0));
+  float theta = acos(clamp(dir.z, -1.0, 1.0));
+  if (theta > fishHalf) { color = vec4(0.0, 0.0, 0.0, 1.0); return; }
+  float r = theta / fishHalf;
+  float phi = atan(dir.y, dir.x);
+  float srcEye = abs(eye - swapEyes);
+  vec2 center = vec2(srcEye < 0.5 ? 0.25 : 0.75, 0.5);
+  vec2 t = center + vec2(cos(phi), -sin(phi)) * r * circleR;
+  color = texture(tex, t);
+}`;
+
+function compile(type, src) {
+  const s = gl.createShader(type); gl.shaderSource(s, src); gl.compileShader(s);
+  if (!gl.getShaderParameter(s, gl.COMPILE_STATUS)) throw new Error(gl.getShaderInfoLog(s));
+  return s;
+}
+const prog = gl.createProgram();
+gl.attachShader(prog, compile(gl.VERTEX_SHADER, VS));
+gl.attachShader(prog, compile(gl.FRAGMENT_SHADER, FS));
+gl.linkProgram(prog);
+if (!gl.getProgramParameter(prog, gl.LINK_STATUS)) throw new Error(gl.getProgramInfoLog(prog));
+gl.useProgram(prog);
+const U = {};
+for (const n of ['tex', 'halfTan', 'rot', 'sbs', 'swapEyes', 'fishHalf', 'circleR']) U[n] = gl.getUniformLocation(prog, n);
+
+const buf = gl.createBuffer();
+gl.bindBuffer(gl.ARRAY_BUFFER, buf);
+gl.bufferData(gl.ARRAY_BUFFER, new Float32Array([-1, -1, 1, -1, -1, 1, 1, 1]), gl.STATIC_DRAW);
+const loc = gl.getAttribLocation(prog, 'p');
+gl.enableVertexAttribArray(loc);
+gl.vertexAttribPointer(loc, 2, gl.FLOAT, false, 0, 0);
+
+const tex = gl.createTexture();
+let imgW = 0, imgH = 0;
+gl.bindTexture(gl.TEXTURE_2D, tex);
+gl.texImage2D(gl.TEXTURE_2D, 0, gl.RGBA, 1, 1, 0, gl.RGBA, gl.UNSIGNED_BYTE, new Uint8Array([0, 0, 0, 255]));
+gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_WRAP_S, gl.CLAMP_TO_EDGE);
+gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_WRAP_T, gl.CLAMP_TO_EDGE);
+gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_MAG_FILTER, gl.LINEAR);
+gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_MIN_FILTER, gl.LINEAR_MIPMAP_LINEAR);
+gl.uniform1i(U.tex, 0);
+const maxTex = gl.getParameter(gl.MAX_TEXTURE_SIZE);
+
+// ---------- images ----------
+let files = [], index = 0, imgName = '', loading = 0;
+
+async function showImage(i) {
+  if (!files.length) return;
+  index = (i + files.length) % files.length;
+  const f = files[index];
+  const token = ++loading;
+  try {
+    let bmp = await createImageBitmap(f, { imageOrientation: 'none' });
+    if (bmp.width > maxTex || bmp.height > maxTex) {
+      const k = maxTex / Math.max(bmp.width, bmp.height);
+      bmp = await createImageBitmap(f, { resizeWidth: Math.floor(bmp.width * k), resizeHeight: Math.floor(bmp.height * k), resizeQuality: 'high' });
+    }
+    if (token !== loading) return;
+    gl.bindTexture(gl.TEXTURE_2D, tex);
+    gl.texImage2D(gl.TEXTURE_2D, 0, gl.RGBA, gl.RGBA, gl.UNSIGNED_BYTE, bmp);
+    gl.generateMipmap(gl.TEXTURE_2D);
+    imgW = bmp.width; imgH = bmp.height; imgName = f.name;
+    bmp.close();
+  } catch (e) {
+    imgName = f.name + ' (failed to load: ' + e.message + ')';
+  }
+}
+
+function setFiles(list) {
+  files = [...list].filter(f => f.type.startsWith('image/'))
+    .sort((a, b) => a.name.localeCompare(b.name, undefined, { numeric: true }));
+  showImage(0);
+}
+if (P.has('src')) {   // ?src=photo.jpg loads an image served next to the page
+  fetch(P.get('src')).then(r => r.blob())
+    .then(b => setFiles([new File([b], P.get('src').split('/').pop(), { type: b.type || 'image/jpeg' })]));
+}
+document.getElementById('file').addEventListener('change', e => setFiles(e.target.files));
+addEventListener('dragover', e => e.preventDefault());
+addEventListener('drop', e => { e.preventDefault(); setFiles(e.dataTransfer.files); });
+
+// ---------- head tracking via VR-Lite mouse deltas ----------
+// The driver writes REL_X/REL_Y = angular velocity * mouse_sensitivity / imu_rate,
+// so one mouse count equals 1/sens degrees of head rotation.
+let yaw = 0, pitch = 0;
+const DEG = Math.PI / 180;
+
+addEventListener('mousemove', e => {
+  if (document.pointerLockElement !== canvas) return;
+  yaw += (S.invertX ? -1 : 1) * e.movementX / S.sens;
+  pitch -= (S.invertY ? -1 : 1) * e.movementY / S.sens;
+  pitch = Math.max(-89, Math.min(89, pitch));
+});
+const recenter = () => { yaw = 0; pitch = 0; };
+
+const overlay = document.getElementById('overlay');
+document.getElementById('start').addEventListener('click', () => {
+  // unadjustedMovement skips OS pointer acceleration, which would distort head angles
+  const r = canvas.requestPointerLock({ unadjustedMovement: true });
+  if (r && r.catch) r.catch(() => canvas.requestPointerLock());
+});
+document.addEventListener('pointerlockchange', () => {
+  overlay.classList.toggle('hidden', document.pointerLockElement === canvas);
+});
+canvas.addEventListener('click', () => { if (document.pointerLockElement !== canvas) canvas.requestPointerLock(); });
+
+// ---------- controls ----------
+function act(name) {
+  switch (name) {
+    case 'next': showImage(index + 1); break;
+    case 'prev': showImage(index - 1); break;
+    case 'recenter': recenter(); break;
+    case 'swap': S.swap = !S.swap; break;
+    case 'zoomIn': S.viewFov = Math.max(15, S.viewFov - 2); break;
+    case 'zoomOut': S.viewFov = Math.min(120, S.viewFov + 2); break;
+    case 'circleDown': S.circle = Math.max(0.5, +(S.circle - 0.01).toFixed(2)); break;
+    case 'circleUp': S.circle = Math.min(1.5, +(S.circle + 0.01).toFixed(2)); break;
+    case 'mode': S.sbs = !S.sbs; break;
+    case 'hud': S.hud = !S.hud; break;
+    case 'fullscreen':
+      document.fullscreenElement ? document.exitFullscreen() : document.documentElement.requestFullscreen();
+      break;
+  }
+}
+const KEYS = { ArrowRight: 'next', PageDown: 'next', ArrowLeft: 'prev', PageUp: 'prev', ' ': 'recenter', r: 'recenter',
+  s: 'swap', '+': 'zoomIn', '=': 'zoomIn', '-': 'zoomOut', '[': 'circleDown', ']': 'circleUp', m: 'mode', h: 'hud', f: 'fullscreen' };
+addEventListener('keydown', e => {
+  const a = KEYS[e.key.length === 1 ? e.key.toLowerCase() : e.key];
+  if (a) { act(a); e.preventDefault(); }
+});
+
+// Gamepad (standard mapping): edge-triggered buttons, held triggers zoom.
+const GP = { 0: 'next', 1: 'prev', 3: 'recenter', 2: 'swap', 15: 'next', 14: 'prev' };
+let prevButtons = [];
+function pollGamepad() {
+  const gp = [...(navigator.getGamepads ? navigator.getGamepads() : [])].find(Boolean);
+  if (!gp) return;
+  gp.buttons.forEach((b, i) => { if (b.pressed && !prevButtons[i] && GP[i]) act(GP[i]); });
+  prevButtons = gp.buttons.map(b => b.pressed);
+  if (gp.buttons[6] && gp.buttons[6].value > 0.3) S.viewFov = Math.min(120, S.viewFov + 0.5);
+  if (gp.buttons[7] && gp.buttons[7].value > 0.3) S.viewFov = Math.max(15, S.viewFov - 0.5);
+}
+
+// ---------- render loop ----------
+const hud = document.getElementById('hud');
+function frame() {
+  pollGamepad();
+  const dpr = devicePixelRatio || 1;
+  const w = Math.round(innerWidth * dpr), h = Math.round(innerHeight * dpr);
+  if (canvas.width !== w || canvas.height !== h) { canvas.width = w; canvas.height = h; }
+  gl.viewport(0, 0, w, h);
+
+  const eyeW = S.sbs ? w / 2 : w;
+  const ht = Math.tan(S.viewFov * DEG / 2);
+  gl.uniform2f(U.halfTan, ht, ht * h / eyeW);
+
+  // rot = Ry(yaw) * Rx(pitch), column-major for GLSL
+  const cy = Math.cos(yaw * DEG), sy = Math.sin(yaw * DEG), cp = Math.cos(pitch * DEG), sp = Math.sin(pitch * DEG);
+  gl.uniformMatrix3fv(U.rot, false, [cy, 0, -sy, -sy * sp, cp, -cy * sp, sy * cp, sp, cy * cp]);
+
+  gl.uniform1f(U.sbs, S.sbs ? 1 : 0);
+  gl.uniform1f(U.swapEyes, S.swap ? 1 : 0);
+  gl.uniform1f(U.fishHalf, S.fishFov * DEG / 2);
+  // circle radius in pixels = circle * min(halfWidth, height) / 2, converted to uv units
+  const R = imgW ? S.circle * Math.min(imgW / 2, imgH) / 2 : 1;
+  gl.uniform2f(U.circleR, imgW ? R / imgW : 0.25, imgH ? R / imgH : 0.5);
+  gl.drawArrays(gl.TRIANGLE_STRIP, 0, 4);
+
+  hud.textContent = S.hud ? [
+    files.length ? `${index + 1}/${files.length}  ${imgName}` : 'No image loaded',
+    `yaw ${yaw.toFixed(1)}  pitch ${pitch.toFixed(1)}  fov ${S.viewFov}  circle ${S.circle}  ${S.sbs ? 'SBS' : '2D'}${S.swap ? '  swapped' : ''}`,
+  ].join('\n') : '';
+  requestAnimationFrame(frame);
+}
+requestAnimationFrame(frame);
+</script>
+</body>
+</html>
